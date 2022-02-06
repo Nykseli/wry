@@ -12,16 +12,17 @@ fn main() -> wry::Result<()> {
       window::{Window, WindowBuilder},
     },
     http::ResponseBuilder,
-    webview::WebViewBuilder,
+    webview::{RpcRequest, WebViewBuilder},
   };
 
   let event_loop = EventLoop::new();
   let window = WindowBuilder::new().build(&event_loop).unwrap();
 
-  let handler = |_window: &Window, req: String| {
-    if &req == "process-complete" {
+  let handler = |_window: &Window, req: RpcRequest| {
+    if &req.method == "process-complete" {
       exit(0);
     }
+    None
   };
   let webview = WebViewBuilder::new(window)
     .unwrap()
@@ -49,7 +50,7 @@ fn main() -> wry::Result<()> {
       ResponseBuilder::new().mimetype(mimetype).body(data)
     })
     .with_url("wry.bench://")?
-    .with_ipc_handler(handler)
+    .with_rpc_handler(handler)
     .build()?;
 
   event_loop.run(move |event, _, control_flow| {
@@ -66,4 +67,3 @@ fn main() -> wry::Result<()> {
     }
   });
 }
-

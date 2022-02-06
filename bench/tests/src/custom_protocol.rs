@@ -18,20 +18,21 @@ fn main() -> wry::Result<()> {
       window::{Window, WindowBuilder},
     },
     http::ResponseBuilder,
-    webview::WebViewBuilder,
+    webview::{RpcRequest, WebViewBuilder},
   };
 
   let event_loop = EventLoop::new();
   let window = WindowBuilder::new().build(&event_loop).unwrap();
 
-  let handler = |_window: &Window, req: String| {
-    if &req == "dom-loaded" {
+  let handler = |_window: &Window, req: RpcRequest| {
+    if &req.method == "dom-loaded" {
       exit(0);
     }
+    None
   };
   let webview = WebViewBuilder::new(window)
     .unwrap()
-    .with_ipc_handler(handler)
+    .with_rpc_handler(handler)
     .with_custom_protocol("wry.bench".into(), move |_request| {
       let index_html = r#"
       <!DOCTYPE html>
@@ -45,7 +46,7 @@ fn main() -> wry::Result<()> {
           <h1>Welcome to WRY!</h1>
           <script>
             document.addEventListener('DOMContentLoaded', () => {
-              ipc.postMessage('dom-loaded')
+              rpc.call('dom-loaded')
             })
           </script>
         </body>

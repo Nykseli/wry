@@ -46,7 +46,7 @@ use crate::{
     dpi::{LogicalSize, PhysicalSize},
     window::Window,
   },
-  webview::{FileDropEvent, WebContext, WebViewAttributes},
+  webview::{FileDropEvent, RpcRequest, RpcResponse, WebContext, WebViewAttributes},
   Result,
 };
 
@@ -61,7 +61,10 @@ pub struct InnerWebView {
   manager: id,
   // Note that if following functions signatures are changed in the future,
   // all fucntions pointer declarations in objc callbacks below all need to get updated.
-  ipc_handler_ptr: *mut (Box<dyn Fn(&Window, String)>, Rc<Window>),
+  rpc_handler_ptr: *mut (
+    Box<dyn Fn(&Window, RpcRequest) -> Option<RpcResponse>>,
+    Rc<Window>,
+  ),
   #[cfg(target_os = "macos")]
   file_drop_ptr: *mut (Box<dyn Fn(&Window, FileDropEvent) -> bool>, Rc<Window>),
   protocol_ptrs: Vec<*mut Box<dyn Fn(&HttpRequest) -> Result<HttpResponse>>>,
@@ -73,19 +76,33 @@ impl InnerWebView {
     attributes: WebViewAttributes,
     mut web_context: Option<&mut WebContext>,
   ) -> Result<Self> {
-    // Function for ipc handler
+    // Function for rpc handler
     extern "C" fn did_receive(this: &Object, _: Sel, _: id, msg: id) {
       // Safety: objc runtime calls are unsafe
       unsafe {
         let function = this.get_ivar::<*mut c_void>("function");
         if !function.is_null() {
-          let function =
-            &mut *(*function as *mut (Box<dyn for<'r> Fn(&'r Window, String)>, Rc<Window>));
+          let function = &mut *(*function
+            as *mut (
+              Box<dyn for<'r> Fn(&'r Window, RpcRequest) -> Option<RpcResponse>>,
+              Rc<Window>,
+            ));
           let body: id = msg_send![msg, body];
           let utf8: *const c_char = msg_send![body, UTF8String];
           let js = CStr::from_ptr(utf8).to_str().expect("Invalid UTF8 string");
 
-          (function.0)(&function.1, js.to_string());
+          match super::rpc_proxy(&function.1, js.to_string(), &function.0) {
+            Ok(result) => {
+              let script = result.unwrap_or_default();
+              let wv: id = msg_send![msg, webView];
+              let js = NSString::new(&script);
+              let _: id =
+                msg_send![wv, evaluateJavaScript:js completionHandler:null::<*const c_void>()];
+            }
+            Err(e) => {
+              log::warn!("RPC result encounter the error: {}", e);
+            }
+          }
         } else {
           log::warn!("WebView instance is dropped! This handler shouldn't be called.");
         }
@@ -287,7 +304,7 @@ impl InnerWebView {
       }
 
       // Message handler
-      let ipc_handler_ptr = if let Some(ipc_handler) = attributes.ipc_handler {
+      let rpc_handler_ptr = if let Some(rpc_handler) = attributes.rpc_handler {
         let cls = ClassDecl::new("WebViewDelegate", class!(NSObject));
         let cls = match cls {
           Some(mut cls) => {
@@ -301,12 +318,12 @@ impl InnerWebView {
           None => class!(WebViewDelegate),
         };
         let handler: id = msg_send![cls, new];
-        let ipc_handler_ptr = Box::into_raw(Box::new((ipc_handler, window.clone())));
+        let rpc_handler_ptr = Box::into_raw(Box::new((rpc_handler, window.clone())));
 
-        (*handler).set_ivar("function", ipc_handler_ptr as *mut _ as *mut c_void);
-        let ipc = NSString::new("ipc");
-        let _: () = msg_send![manager, addScriptMessageHandler:handler name:ipc];
-        ipc_handler_ptr
+        (*handler).set_ivar("function", rpc_handler_ptr as *mut _ as *mut c_void);
+        let external = NSString::new("external");
+        let _: () = msg_send![manager, addScriptMessageHandler:handler name:external];
+        rpc_handler_ptr
       } else {
         null_mut()
       };
@@ -331,7 +348,7 @@ impl InnerWebView {
         #[cfg(target_os = "macos")]
         ns_window,
         manager,
-        ipc_handler_ptr,
+        rpc_handler_ptr,
         #[cfg(target_os = "macos")]
         file_drop_ptr,
         protocol_ptrs,
@@ -339,9 +356,11 @@ impl InnerWebView {
 
       // Initialize scripts
       w.init(
-r#"Object.defineProperty(window, 'ipc', {
-  value: Object.freeze({postMessage: function(s) {window.webkit.messageHandlers.ipc.postMessage(s);}})
-});"#,
+        r#"window.external = {
+              invoke: function(s) {
+                window.webkit.messageHandlers.external.postMessage(s);
+              },
+            };"#,
       );
       for js in attributes.initialization_scripts {
         w.init(&js);
@@ -481,8 +500,8 @@ impl Drop for InnerWebView {
   fn drop(&mut self) {
     // We need to drop handler closures here
     unsafe {
-      if !self.ipc_handler_ptr.is_null() {
-        let _ = Box::from_raw(self.ipc_handler_ptr);
+      if !self.rpc_handler_ptr.is_null() {
+        let _ = Box::from_raw(self.rpc_handler_ptr);
       }
 
       #[cfg(target_os = "macos")]
